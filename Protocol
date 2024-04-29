@@ -1,0 +1,740 @@
+**Mouse/Keyboard Forwarding Over Bluetooth: Complete Developer Specification**
+
+---
+
+## 1. Overview
+
+Enable a user to connect a Bluetooth mouse (and keyboard) to **PC 1** and, by clicking the scroll wheel five times in quick succession, toggle control over to **PC 2**. While forwarding is active, all mouse and keyboard events captured on PC 1 are sent to PC 2 over a Bluetooth link and injected into PC 2’s OS. Clicking the scroll wheel five times again returns control to PC 1. The system must handle link drops, avoid input loops, and give clear feedback to the user.
+
+Key points:
+
+* **Toggle Macro:** Five discrete scroll‐wheel clicks within 1.5 seconds, each with full release.
+* **HID Capture (PC 1):** Use raw HID APIs in non‐exclusive mode so the native cursor still works.
+* **Event Forwarding:** Serialize each mouse/keyboard event into a compact binary struct (≤ 20 bytes) and send immediately over Bluetooth (SPP or BLE).
+* **Event Injection (PC 2):** Inject received events via OS APIs (SendInput on Windows, uinput on Linux, CGEvent on macOS).
+* **Loop Prevention:** Tag each forwarded event with a 1 byte source ID (0x01=PC 1, 0x02=PC 2). PC 1 drops any event marked 0x02; PC 2 drops events marked 0x01 when listening locally.
+* **State Resynchronization:** On any reconnect, PC 2 sends its last known “forwarding vs local” state in the HELLO; PC 1 replies with its current state. If they differ, PC 1 sends a TOGGLE\_OFF or TOGGLE\_ON to align both sides.
+* **Error Handling:** Heartbeat messages every 5 s; if PC 2 misses three in a row (15 s), it reverts to local. PC 1 retries sending TOGGLE\_ON up to three times if no ACK is received.
+* **User Feedback:** Tray icon on PC 1 (gray=local, green=forwarding); a brief “Forwarding Active” banner on PC 2.
+
+---
+
+## 2. System Architecture
+
+| Component          | Role                                                                                                                                                                                                                                                                               |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **PC 1 (Server)**  | - Paired to the Bluetooth mouse (HID profile).  <br> - Captures raw HID events (mouse/keyboard) via OS API. <br> - Detects the five‐click toggle. <br> - Serializes and sends each event over Bluetooth to PC 2. <br> - Manages state: LOCAL\_CONTROL ↔ FORWARDING ↔ DISCONNECTED. |
+| **PC 2 (Client)**  | - Paired to PC 1 (SPP or BLE GATT). <br> - Performs initial handshake (HELLO/ACK). <br> - Receives serialized events, drops duplicates via sequence/source tags. <br> - Injects events into local OS input. <br> - Sends heartbeats; handles reconnects and state sync.            |
+| **Bluetooth Link** | - Wireless channel carrying control messages and input‐event payloads. <br> - Could be Bluetooth Classic SPP (no fragmentation, higher throughput) or BLE (20 B MTU, low power).                                                                                                   |
+
+---
+
+## 3. Protocol & Message Formats
+
+All messages are sent as binary packets. Each packet begins with a 1‐byte **Message Type** field, followed by type‐specific payload.
+
+### 3.1 Message Types (1 byte)
+
+* `0x10` = HELLO
+* `0x11` = ACK
+* `0x12` = TOGGLE\_ON
+* `0x13` = TOGGLE\_OFF
+* `0x14` = INPUT\_EVENT
+* `0x15` = HEARTBEAT
+* `0x16` = FLUSH\_SEQ
+
+### 3.2 HELLO / ACK (Handshake & State Sync)
+
+* **HELLO (PC 2→PC 1)**
+
+  * Byte 0: `0x10`
+  * Byte 1: `state_flag` (0x00 = LOCAL\_CONTROL, 0x01 = FORWARDING)
+  * Byte 2-5: `lastSeq` (uint32, little‐endian) — highest‐sequence event PC 2 processed before sleeping or disconnect
+
+* **ACK (PC 1→PC 2)**
+
+  * Byte 0: `0x11`
+  * Byte 1: `state_flag` (0x00 = LOCAL\_CONTROL, 0x01 = FORWARDING)
+  * Byte 2-5: `currentSeq` (uint32) — highest‐sequence event PC 1 has sent or processed
+
+**Use:** Whenever Bluetooth reconnects (after sleep or range loss), PC 2 immediately sends HELLO with its last known state and lastSeq. PC 1 replies with ACK containing its current state and currentSeq. If PC 2’s state ≠ PC 1’s state, PC 1 sends a TOGGLE\_ON or TOGGLE\_OFF to align. PC 2 then updates its UI accordingly.
+
+### 3.3 TOGGLE\_ON / TOGGLE\_OFF
+
+* **TOGGLE\_ON (PC 1→PC 2)**
+
+  * Byte 0: `0x12`
+  * Byte 1: (reserved) = `0x00`
+  * Byte 2-5: (optional) `toggleSeq` (uint32) — sequence number at time of toggle
+
+* **TOGGLE\_OFF (PC 1→PC 2)**
+
+  * Byte 0: `0x13`
+  * Byte 1: (reserved) = `0x00`
+  * Byte 2-5: `toggleSeq` (uint32)
+
+**Use:** When PC 1’s macro detector sees five scroll clicks in 1.5 s, it toggles its internal state:
+
+* If going LOCAL→FORWARDING, send TOGGLE\_ON (include last sequence number).
+* If going FORWARDING→LOCAL, send TOGGLE\_OFF (include last sequence).
+
+PC 2, upon receiving TOGGLE\_ON, switches to FORWARDING mode, begins injecting incoming events only. Upon TOGGLE\_OFF, PC 2 stops injecting and re‐enables local input.
+
+### 3.4 INPUT\_EVENT
+
+Each **INPUT\_EVENT** packet carries a single low‐level HID action. Structure (all multi‐byte fields = little‐endian):
+
+| Byte 0 | Byte 1–4         | Byte 5–6          | Byte 7–8           | Byte 9           | Byte 10        | Byte 11–14        | Byte 15          |
+| ------ | ---------------- | ----------------- | ------------------ | ---------------- | -------------- | ----------------- | ---------------- |
+| `0x14` | `sourceID` (1 B) | `eventType` (1 B) | `actionFlag` (1 B) | Reserved 0 (1 B) | `seqNum` (4 B) | `timestamp` (4 B) | `checksum` (1 B) |
+
+* **Byte 1 = sourceID:**
+
+  * `0x01` = event originated on PC 1
+  * `0x02` = PC 2 (only used if PC 2 ever sends events; in our scheme, PC 2 doesn’t forward to PC 1, so PC 1 always sees 0x01)
+* **Byte 2 = eventType:**
+
+  * `0x01` = Mouse Move
+  * `0x02` = Mouse Button
+  * `0x03` = Keyboard
+  * `0x04` = Scroll
+* **Byte 3 = actionFlag (meaning depends on eventType):**
+
+  * For **Mouse Move (0x01):** ignored (0), use Bytes 5–8
+  * For **Mouse Button (0x02):** `0x01`=down, `0x00`=up; button ID in Byte 4
+  * For **Keyboard (0x03):** `0x01`=down, `0x00`=up; keycode in Byte 4 (e.g., USB HID code)
+  * For **Scroll (0x04):** signed int8 in Byte 4 representing scroll delta; Byte 3 ignored
+* **Byte 4:**
+
+  * See above: button ID byte, keycode byte, or scroll delta (int8).
+* **Bytes 5–8 = seqNum (uint32):** monotonic counter incremented by PC 1 for each event sent (wrap at 2³²).
+* **Bytes 9–12 = timestamp (uint32):** milliseconds since application start or since last toggle—used for debugging or advanced drop logic.
+* **Byte 13 = checksum:** XOR of Bytes 0–12. Verify on receipt; if mismatch, drop packet.
+
+**Special handling (Mouse Move):**
+
+* Use Bytes 5–6 for `dx` (int16).
+* Use Bytes 7–8 for `dy` (int16).
+* Set Byte 4 = 0x00.
+* `actionFlag` = 0x00.
+
+Example (Mouse Move +5 x, –3 y):
+
+```
+[0x14][0x01][0x01][0x00][0x00][ seq−byte0 ][ seq−byte1 ][ seq−byte2 ][ seq−byte3 ][ ts−b0 ][ ts−b1 ][ ts−b2 ][ ts−b3 ][ checksum ]
+But for clarity:
+Byte 0 = 0x14
+Byte 1 = 0x01 (PC 1)
+Byte 2 = 0x01 (Mouse Move)
+Byte 3 = 0x00
+Byte 4 = 0x00
+Byte 5–6 = dx = +5 (int16 little): 0x05 0x00
+Byte 7–8 = dy = –3 (int16 little): 0xFD 0xFF
+Byte 9–12 = seqNum (e.g., 0x2A 0x00 0x00 0x00)
+Byte 13–16 = timestamp (e.g., 0x10 0x27 0x00 0x00 = 10000 ms)
+Byte 17 = checksum = XOR(Bytes 0–16)
+```
+
+(Note: total = 18 bytes—which fits under BLE’s 20 B MTU.)
+
+### 3.5 HEARTBEAT
+
+* **Packet format (5 bytes):**
+
+  * Byte 0: `0x15`
+  * Byte 1–4: currentSeq (uint32) — last sequence number PC 1 or PC 2 has sent/processed
+
+**Use:** PC 1 sends HEARTBEAT every 5 s when in FORWARDING mode. PC 2 sends HEARTBEAT every 5 s when in FORWARDING mode (optional). If either side misses three consecutive HEARTBEATs (15 s), it assumes the other is gone. PC 2 reverts to LOCAL\_CONTROL if it misses PC 1’s heartbeats. PC 1 falls back to LOCAL\_CONTROL if it doesn’t get an expected ACK or heartbeat that it relies on.
+
+### 3.6 FLUSH\_SEQ
+
+* **Packet format (5 bytes):**
+
+  * Byte 0: `0x16`
+  * Byte 1–4: flushSeq (uint32)
+
+**Use:** When PC 1 toggles OFF, it sends FLUSH\_SEQ = last sent sequence number. PC 2, upon receiving FLUSH\_SEQ, discards any pending or buffered events with `seqNum ≤ flushSeq`. Ensures no late‐arriving events slip through.
+
+---
+
+## 4. State Machine & Flow (PC 1)
+
+1. **Initialization:**
+
+   * Pair BT mouse (HID) → PC 1.
+   * Pair PC 1 ↔ PC 2 (SPP or BLE).
+   * Open Raw HID channel for mouse events (non‐exclusive).
+   * Open Bluetooth server socket (SPP RFCOMM) or BLE GATT service.
+
+2. **States:**
+
+   * **LOCAL\_CONTROL:**
+
+     * Mouse/keyboard drive PC 1 normally.
+     * Listen for macro toggle (five scroll clicks).
+     * Maintain `currentState = 0x00`.
+   * **FORWARDING:**
+
+     * Capture all raw HID events on mouse/keyboard.
+     * For each event:
+
+       1. Increment `seqNum`.
+       2. Serialize into INPUT\_EVENT with `sourceID = 0x01`.
+       3. Send immediately over Bluetooth.
+     * Listen for TOGGLE\_OFF macro on scroll clicks.
+     * Send HEARTBEAT every 5 s (Byte 0=0x15, Bytes 1–4=`seqNum`).
+   * **DISCONNECTED:**
+
+     * Bluetooth link not active.
+     * Attempt reconnection every 2 s, up to N times.
+     * On reconnect, perform HELLO/ACK handshake (sync state).
+     * Based on handshake, go to LOCAL\_CONTROL or FORWARDING.
+
+3. **Macro Detection (Scroll‐Wheel Logic):**
+
+   * Maintain a small ring buffer of timestamps when a scroll‐wheel “press” event occurs.
+   * Require full “press→release” before counting the next.
+   * If five timestamps fit within 1.5 s (user‐configurable), trigger toggle.
+   * Reset buffer on toggle.
+
+4. **Toggle Logic:**
+
+   * **If `currentState == LOCAL_CONTROL` and macro detected:**
+
+     * Set `currentState = FORWARDING`.
+     * Send TOGGLE\_ON (Byte 0=0x12, Bytes 1=0x00, Bytes 2–5=`seqNum`).
+     * Start forwarding events.
+     * Update tray icon to green.
+   * **If `currentState == FORWARDING` and macro detected:**
+
+     * Set `currentState = LOCAL_CONTROL`.
+     * Send FLUSH\_SEQ (`0x16` + last `seqNum`) immediately.
+     * Send TOGGLE\_OFF (`0x13` + last `seqNum`).
+     * Stop event forwarding.
+     * Update tray icon to gray.
+
+5. **Heartbeat & Timeout:**
+
+   * In FORWARDING, send HEARTBEAT every 5 s.
+   * If no ACK or reply from PC 2 in 15 s (3 heartbeats missed), assume disconnected → go to DISCONNECTED.
+   * In DISCONNECTED, revert to LOCAL\_CONTROL (if not already) and update tray icon.
+
+6. **Reconnect & Handshake:**
+
+   * On any Bluetooth reconnect, PC 1 waits for PC 2’s HELLO.
+   * If PC 2 HELLO arrives with its `lastSeq` and `state`, PC 1 replies with ACK containing `currentState` and `currentSeq`.
+   * If PC 2’s `state` ≠ `currentState`, PC 1 immediately sends a TOGGLE\_ON or TOGGLE\_OFF to align.
+   * Resume in whichever state PC 1 is in.
+
+---
+
+## 5. PC 2 Responsibilities
+
+1. **Initialization:**
+
+   * Pair with PC 1 via SPP or BLE.
+   * Launch forwarding app; open Bluetooth client socket or subscribe to BLE GATT characteristic.
+
+2. **States:**
+
+   * **LOCAL\_CONTROL:** (default after launch or after TOGGLE\_OFF)
+
+     * Local mouse/keyboard function normally.
+     * Internally track `currentState = 0x00`.
+     * Listen for incoming TOGGLE\_ON.
+   * **FORWARDING:** (after receiving TOGGLE\_ON)
+
+     * Drop all local HID events (filter them out in your app).
+     * For each incoming INPUT\_EVENT:
+
+       1. Verify checksum; drop if invalid.
+       2. Check `sourceID`: if `0x01`, proceed; if `0x02`, drop (loop prevention).
+       3. Check `seqNum > lastSeqProcessed`; if not, drop.
+       4. Inject based on `eventType` & `actionFlag` via OS API.
+       5. Update `lastSeqProcessed`.
+     * Send HEARTBEAT every 5 s (optional).
+     * Listen for TOGGLE\_OFF and FLUSH\_SEQ.
+   * **DISCONNECTED:**
+
+     * If Bluetooth disconnects or no HEARTBEAT for 15 s, set `currentState = LOCAL_CONTROL`.
+     * Show “Reconnecting…” UI overlay until reconnected.
+
+3. **Handshake & Resync:**
+
+   * On any BT reconnect, immediately send HELLO (Byte 0=0x10, Byte 1=`currentState`, Bytes 2–5=`lastSeqProcessed`).
+   * Wait for ACK (Byte 0=0x11). Read `serverState` and `currentSeq` from PC 1.
+   * If `serverState == LOCAL_CONTROL` but `currentState == FORWARDING`, drop to LOCAL\_CONTROL; show banner “Back to Local Control.”
+   * If `serverState == FORWARDING` but `currentState == LOCAL_CONTROL`, set `currentState = FORWARDING`; show “Forwarding Active.”
+   * Discard any pending events with `seqNum ≤ currentSeq`.
+
+4. **Injection APIs (Per OS):**
+
+   * **Windows:** Use `SendInput` with `MOUSEINPUT` or `KEYBDINPUT`. E.g., for mouse move:
+
+     ```c
+     INPUT input = { .type = INPUT_MOUSE };
+     input.mi.dx = dx; input.mi.dy = dy;
+     input.mi.dwFlags = MOUSEEVENTF_MOVE;
+     SendInput(1, &input, sizeof(INPUT));
+     ```
+
+     For button or scroll: set `dwFlags` to `MOUSEEVENTF_LEFTDOWN`, `MOUSEEVENTF_LEFTUP`, `MOUSEEVENTF_WHEEL` (with `mouseData = scrollDelta`).
+   * **Linux:** Open `/dev/uinput` (requires root or `CAP_SYS_ADMIN`).
+
+     1. `ioctl(uinput_fd, UI_DEV_CREATE, &uidev)` to create a virtual device.
+     2. For each event: write `struct input_event ev;` (with `type=EV_REL` for mouse move, `EV_KEY` for buttons, `EV_REL` for scrollwheel).
+     3. `write(uinput_fd, &ev, sizeof(ev));` then send a `EV_SYN` event.
+   * **macOS:**
+
+     ```objc
+     CGEventRef evt = CGEventCreateMouseEvent(
+       NULL, kCGEventMouseMoved,
+       CGPointMake(currentX + dx, currentY + dy),
+       kCGMouseButtonLeft
+     );
+     CGEventPost(kCGHIDEventTap, evt);
+     CFRelease(evt);
+     ```
+
+     For buttons: use `kCGEventLeftMouseDown`, etc. For keyboard: `CGEventCreateKeyboardEvent`.
+
+5. **Loop Prevention:**
+
+   * Drop any INPUT\_EVENT with `sourceID == 0x02`. Since PC 2 never forwards back to PC 1, it’s sufficient to ignore any event that was tagged 0x02 if somehow it arrives locally.
+   * Also compare each event’s `seqNum` with `lastSeqProcessed`. Drop if `seqNum ≤ lastSeqProcessed`.
+
+6. **FLUSH & TOGGLE\_OFF Handling:**
+
+   * On receiving FLUSH\_SEQ (Byte 0=0x16, Bytes 1–4 = flushSeq), discard any buffered or in‐flight events with `seqNum ≤ flushSeq`.
+   * On TOGGLE\_OFF (Byte 0=0x13, Bytes 1–4 = toggleSeq), do the same discard, set `currentState = LOCAL_CONTROL`, and update UI (“Back to Local Control”).
+
+7. **Heartbeat Timeout:**
+
+   * Expect HEARTBEAT (Byte 0=0x15) every 5 s when in FORWARDING. Track last heartbeat time. If no heartbeat within 15 s, treat as DISCONNECTED: set `currentState = LOCAL_CONTROL`, show “Connection Lost—Reconnecting…,” and attempt Bluetooth reconnect.
+
+---
+
+## 6. Bluetooth Layer & Pairing
+
+1. **Device Pairing:**
+
+   * **Step 1:** On PC 1, user opens OS Bluetooth settings, chooses “Add Device,” selects PC 2. Enter PIN or confirm numeric code once.
+   * **Step 2:** On PC 2, OS shows pairing request, confirm. Now PC 1↔PC 2 are bonded.
+   * **Step 3:** On PC 1, pair Bluetooth mouse (HID profile) via OS Bluetooth UI. Enter PIN if required (often none).
+   * **Step 4:** Launch the forwarding app on both PCs.
+
+2. **Connection Channel:**
+
+   * **Option A: Bluetooth Classic SPP (RFCOMM).**
+
+     * Advantage: Up to \~128 KB/s, no small‐MTU fragmentation.
+     * Implementation: PC 1 listens on RFCOMM (e.g., channel 5). PC 2 connects via `socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM)`.
+   * **Option B: Bluetooth LE GATT Service.**
+
+     * Advantage: Lower power.
+     * Tradeoff: 20 bytes MTU by default → input packet ≤ 20 bytes. Otherwise, implement fragmentation/reassembly.
+     * Implementation: Define a custom GATT service with one characteristic for messages. PC 1 advertises; PC 2 scans and writes to the characteristic.
+
+3. **MTU & Packet Sizing (BLE):**
+
+   * Design each INPUT\_EVENT ≤ 20 bytes (see section 3.4).
+   * HELLO, ACK, TOGGLE, HEARTBEAT, FLUSH all ≤ 6 bytes → fine.
+   * If you need more than 20 bytes (e.g., future batch mode), fragment: send first fragment with a header (e.g., “F1,” total length), then follow with “F2” until complete. Reassemble on PC 2 before processing.
+
+4. **Security:**
+
+   * Rely on standard Bluetooth pairing (encryption, MITM protection via PIN or numeric confirmation). This prevents unauthorized third parties from injecting events.
+   * Optionally, include a 4 byte “app token” inside each message. PC 2 drops messages if token ≠ expected. That guards against a paired rogue device spamming your channel.
+
+---
+
+## 7. HID Capture on PC 1 (Non‐Exclusive Raw Input)
+
+### 7.1 Windows (Raw Input)
+
+1. **Register for Raw Input**
+
+   ```c
+   RAWINPUTDEVICE rid;
+   rid.usUsagePage = 0x01;         // Generic desktop controls
+   rid.usUsage = 0x02;             // Mouse
+   rid.dwFlags = RIDEV_INPUTSINK;  // Receive events even when in background
+   rid.hwndTarget = hWnd;          // Your application window handle
+   RegisterRawInputDevices(&rid, 1, sizeof(rid));
+   ```
+2. **Process WM\_INPUT**
+
+   ```c
+   UINT dwSize;
+   GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER));
+   LPBYTE lpb = malloc(dwSize);
+   GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER));
+   RAWINPUT* raw = (RAWINPUT*)lpb;
+   if (raw->header.dwType == RIM_TYPEMOUSE) {
+     // raw->data.mouse.lLastX, lLastY for dx, dy
+     // raw->data.mouse.usButtonFlags for button presses/releases
+     // raw->data.mouse.usButtonFlags == RI_MOUSE_WHEEL for scroll
+   }
+   free(lpb);
+   ```
+3. **Ensure Non‐Exclusive**
+
+   * Do NOT set `RIDEV_CAPTUREMOUSE` or `RIDEV_NOLEGACY`. With only `RIDEV_INPUTSINK`, the OS still moves the native cursor.
+
+### 7.2 Linux (evdev)
+
+1. **Identify Mouse Device**
+
+   ```bash
+   ls /dev/input/by-id/    # find your BT mouse (name contains “mouse” or vendor ID)
+   ```
+2. **Open in Non‐Exclusive Mode**
+
+   ```c
+   int fd = open("/dev/input/eventX", O_RDONLY | O_NONBLOCK);
+   // Do NOT ioctl(fd, EVIOCGRAB, 1). That would be exclusive.
+   ```
+3. **Read Events**
+
+   ```c
+   struct input_event ev;
+   while (read(fd, &ev, sizeof(ev)) > 0) {
+     if (ev.type == EV_REL) {
+       if (ev.code == REL_X) dx = ev.value;
+       if (ev.code == REL_Y) dy = ev.value;
+       if (ev.code == REL_WHEEL) scrollDelta = ev.value;
+     }
+     if (ev.type == EV_KEY) {
+       // Button press/release: ev.code = BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, etc.
+       // ev.value = 1 (down), 0 (up), 2 (auto‐repeat)
+     }
+   }
+   ```
+4. **Let X/Wayland See It**
+
+   * Because you didn’t `EVIOCGRAB`, the kernel still dispatches the same events to your window manager. Cursor moves normally.
+
+### 7.3 macOS (IOHIDManager)
+
+1. **Set Up IOHIDManager**
+
+   ```objc
+   IOHIDManagerRef hidManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+   NSDictionary *matchingDict = @{
+     @(kIOHIDDeviceUsagePage): @(kHIDPage_GenericDesktop),
+     @(kIOHIDDeviceUsage): @(kHIDUsage_GD_Mouse)
+   };
+   IOHIDManagerSetDeviceMatching(hidManager, (__bridge CFDictionaryRef)matchingDict);
+   IOHIDManagerRegisterInputValueCallback(hidManager, Handle_Input, NULL);
+   IOHIDManagerScheduleWithRunLoop(hidManager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+   IOHIDManagerOpen(hidManager, kIOHIDOptionsTypeNone);
+   ```
+2. **Callback Implementation**
+
+   ```objc
+   void Handle_Input(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
+     IOHIDElementRef element = IOHIDValueGetElement(value);
+     uint32_t usagePage = IOHIDElementGetUsagePage(element);
+     uint32_t usage = IOHIDElementGetUsage(element);
+     int32_t intValue = IOHIDValueGetIntegerValue(value);
+     if (usagePage == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_X) {
+       dx = intValue;
+     }
+     if (usagePage == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Y) {
+       dy = intValue;
+     }
+     if (usagePage == kHIDPage_Button) {
+       // intValue = 1 (down) or 0 (up) for button events
+     }
+     if (usagePage == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Wheel) {
+       scrollDelta = intValue;
+     }
+     // Package these into an INPUT_EVENT and send if forwarding is ON
+   }
+   ```
+3. **Non‐Exclusive:**
+
+   * Do **not** set `kIOHIDOptionsTypeSeizeDevice`. By default, with only `kIOHIDOptionsTypeNone`, you receive events alongside the OS cursor.
+
+---
+
+## 8. Macro Detection
+
+1. **Requirement:** Detect five scroll‐wheel clicks (press + release) within 1.5 s.
+2. **Implementation:**
+
+   * Maintain an array `timestamps[5]`.
+   * On each scroll “press” event (mouse middle‐button down): record `timestamps[i mod 5] = currentTimeMs`.
+   * Check that all five timestamps are within `1.5 s` of each other and that between each press, a release event occurred.
+   * If so, trigger toggle, then clear all five timestamps (set to 0 or far in the past).
+   * Example pseudocode:
+
+     ```c
+     void onScrollPress() {
+       static int idx = 0;
+       uint32_t now = getTimeMs();
+       timestamps[idx] = now;
+       idx = (idx + 1) % 5;
+       
+       bool isFive = true;
+       int base = (idx) % 5; // oldest of the five if all filled
+       for (int i = 1; i < 5; ++i) {
+         uint32_t delta = now - timestamps[(base + i) % 5];
+         if (delta > 1500) { isFive = false; break; }
+       }
+       if (isFive) {
+         // Confirm each click had a release (track releases in parallel array)
+         if (allReleasedBetweenClicks()) {
+           triggerToggle();
+           clearTimestamps();
+         }
+       }
+     }
+     ```
+   * **Edge‐Case Handling:** A continuous hold or auto‐repeat won’t count because you require press→release between clicks.
+
+---
+
+## 9. Loop Prevention & Sequence Numbering
+
+1. **Tagging Events (Source ID):**
+
+   * Always set `sourceID = 0x01` on PC 1→PC 2. If PC 2 ever sends events back (not required in simple forwarding), it would use `sourceID = 0x02`.
+   * PC 1’s raw capture only serializes physical mouse events; PC 2’s injection uses a virtual HID. PC 1 sees the virtual HID if you use a global hook—but by tagging, you drop any with `sourceID = 0x02`.
+2. **Sequence Numbers:**
+
+   * PC 1 increments `seqNum` (uint32) each time it serializes an INPUT\_EVENT.
+   * PC 2 stores `lastSeqProcessed`. For any incoming event, if `seqNum ≤ lastSeqProcessed`, drop. Otherwise, process and update `lastSeqProcessed = seqNum`.
+3. **Flip Sequences on Toggle:**
+
+   * On TOGGLE\_OFF, PC 1 sends FLUSH\_SEQ = `lastSeqSent`. PC 2 discards any buffered or late events with `seqNum ≤ FLUSH_SEQ`.
+   * That ensures no events from the previous FORWARDING session slip through after toggling back to local.
+
+---
+
+## 10. Error Handling & Resynchronization
+
+1. **Heartbeats:**
+
+   * PC 1 (in FORWARDING) sends HEARTBEAT every 5 s: `[0x15][ seqNum (4 bytes )]`.
+   * PC 2 expects it; if none for 15 s (3 missed), PC 2 drops to LOCAL\_CONTROL, shows “Connection Lost.”
+   * PC 2 (in FORWARDING) may also send HEARTBEAT every 5 s—PC 1 monitors similarly.
+2. **Connection Loss & Reconnect:**
+
+   * If Bluetooth link drops or heartbeats timeout, both sides go to DISCONNECTED. Each tries to reconnect (Classic SPP or BLE connection) every 2 s.
+   * On successful reconnect:
+
+     * PC 2 sends HELLO(`[0x10][ stateFlag ][ lastSeqProcessed ]`).
+     * PC 1 replies ACK(`[0x11][ currentState ][ currentSeq ]`).
+     * If states mismatch, PC 1 sends TOGGLE\_ON or TOGGLE\_OFF immediately so both sides align.
+     * PC 2 discards any events with `seqNum ≤ currentSeq` (in case some late packets arrived during reconnection).
+3. **Malformed/Corrupted Packets:**
+
+   * Each packet includes a 1 byte checksum = XOR of all previous bytes in the packet.
+   * On receive, compute XOR; if mismatch, drop packet silently.
+   * No negative ACK; simply ignore.
+
+---
+
+## 11. Bluetooth Profile Choice
+
+1. **Bluetooth Classic (SPP):**
+
+   * **Pros:**
+
+     * No small‐MTU limitation. Can send up to 1 KB per write.
+     * Slightly lower coding complexity (standard RFCOMM socket).
+   * **Cons:**
+
+     * Higher power draw.
+     * Requires both PCs to have Classic BT stacks (most do).
+2. **Bluetooth LE (GATT):**
+
+   * **Pros:**
+
+     * Low power (good if PCs might be laptops on battery).
+     * Custom characteristic guarantees no interference with other services.
+   * **Cons:**
+
+     * Default MTU = 20 bytes. Must fit each packet ≤ 20 bytes or implement fragmentation (adds complexity & slight latency).
+     * Harder to implement on some Windows versions (BLE support in Win10+ only).
+
+**Recommendation:** If both PCs reliably support Classic SPP, use SPP to simplify packet size. If low-power is critical (e.g., using on battery‐powered tablet), choose BLE and pack each INPUT\_EVENT into ≤ 20 bytes as shown.
+
+---
+
+## 12. Operating-System-Specific Injection & Capture
+
+| OS      | Capture API                             | Injection API                                 | Notes                                                                    |
+| ------- | --------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
+| Windows | RegisterRawInputDevices & WM\_INPUT     | SendInput (MOUSEINPUT / KEYBDINPUT structs)   | No driver install needed; requires window message pump or message hook.  |
+| Linux   | `/dev/input/eventX` (evdev) in non-grab | `/dev/uinput` (create virtual device + write) | Application must run as root or have `CAP_SYS_ADMIN` to open uinput.     |
+| macOS   | IOHIDManager (no seize)                 | CGEventCreateMouseEvent / CGEventPost         | App must be signed with “HID” entitlements for injection in newer macOS. |
+
+* **Windows Raw Input Example:**
+
+  * Pros: easily target a specific HID by Vendor ID / Product ID; no root needed.
+  * Cons: you must have a window message pump and your app window must remain open (could be hidden).
+* **Linux evdev + uinput Example:**
+
+  * Pros: precise, low latency.
+  * Cons: requires elevated privileges; user must allow uinput.
+* **macOS IOHIDManager + CGEvent Example:**
+
+  * Pros: full HID power.
+  * Cons: newer macOS versions require explicit permissions to “monitor input” and to “simulate input”; user must grant Accessibility permission.
+
+---
+
+## 13. User Experience & UI
+
+1. **Pairing Flow:**
+
+   * **Step 1:** On PC 1, user opens Bluetooth settings → “Add Device” → selects PC 2 → confirm pairing.
+   * **Step 2:** On PC 2, confirm pairing. Now PC 1↔PC 2 bonded.
+   * **Step 3:** User launches the forwarding app on both PCs.
+   * **Step 4:** PC 1’s app shows “Paired devices: \[ PC 2 – Click to Connect ]”. User clicks “Connect.” Similarly on PC 2.
+   * **Step 5:** Both apps open the SPP or BLE channel and exchange HELLO/ACK. Default state = LOCAL\_CONTROL.
+
+2. **Tray / Status Icon (PC 1):**
+
+   * **GRAY icon:** LOCAL\_CONTROL (cursor moves PC 1). Tooltip: “Local Control.”
+   * **GREEN icon:** FORWARDING (cursor and keys sent to PC 2). Tooltip: “Forwarding to PC 2.”
+   * On hover over icon, show “Toggle: Scroll wheel × 5 to switch control.”
+   * Optional: Right‐click → “Disconnect” or “Exit.”
+
+3. **On-Screen Banner (PC 2):**
+
+   * When receives TOGGLE\_ON: show a transient banner in bottom-right corner: “Forwarding Active – Mouse & Keyboard from PC 1.” Fade out after 2 s.
+   * When receives TOGGLE\_OFF (or heartbeat timeout): show banner “Back to Local Control.”
+
+4. **Error Indicators:**
+
+   * On PC 2, if HEARTBEAT times out, show “Connection Lost — Attempting Reconnect” (in banner). Keep showing until HELLO/ACK handshake succeeds.
+   * On PC 1, if PC 2 does not ACK a TOGGLE\_ON after 3 retries, show a warning toast “Remote didn’t acknowledge toggle. Will retry.” Keep retrying every 200 ms up to 3 times, then revert to LOCAL\_CONTROL if no ACK.
+
+---
+
+## 14. Security & Authentication
+
+1. **Bluetooth Pairing Encryption**
+
+   * Rely on the OS’s built‐in encryption after pairing. Once paired, the link is encrypted, preventing eavesdropping or injection from unauthorized devices.
+
+2. **Optional App-Level Token**
+
+   * Generate a random 4 byte “appToken” the first time the user pairs. Both PC 1 and PC 2 store this token (file in user’s home).
+   * Prepend the token to each message payload. On receive, verify the token before processing. This stops a different paired device (e.g., a neighbor’s PC) from accidentally injecting.
+
+---
+
+## 15. Performance & Latency
+
+* **Latency Goal:** ≤ 10 ms end-to-end.
+* **Techniques:**
+
+  1. **Immediate Send:** Do not batch input events. As soon as a raw HID event arrives, serialize and send.
+  2. **Compact Struct:** Keep each INPUT\_EVENT ≤ 20 bytes for BLE; if using SPP, 10 – 18 bytes is still minimal overhead.
+  3. **OS Injection:** Use low-level injection APIs (SendInput, uinput, CGEvent) without extra processing.
+  4. **Real-Time Priorities:** If needed, raise thread priority for reading HID and writing to Bluetooth.
+
+---
+
+## 16. Edge Cases & Resilience
+
+1. **False Macro Trigger on Fast Scrolling**
+
+   * Countermeasure: Require full press→release cycles. If the user holds the wheel and “scrolls” rapidly, it won’t register as five discrete clicks.
+2. **Mid-Toggle Link Drop**
+
+   * If PC 1 sends TOGGLE\_ON but link drops immediately:
+
+     1. PC 1 stores `desiredState = FORWARDING` and keeps retrying TOGGLE\_ON every 200 ms (up to 3 retries) until ACK.
+     2. PC 2, on reconnect, sends HELLO with its lastState. PC 1 replies with ACK; if PC 2’s lastState was LOCAL and PC 1 wants FORWARDING, PC 1 sends TOGGLE\_ON again.
+3. **Sleep / Wake**
+
+   * PC 2 goes to sleep while forwarding. Upon wake:
+
+     1. PC 2 has `lastSeqProcessed` and `currentState = FORWARDING`. It attempts reconnect.
+     2. PC 1 replies via ACK with its `currentState`. If PC 1 fell back to LOCAL during sleep, PC 1 sends TOGGLE\_OFF. PC 2 sets `currentState = LOCAL`.
+4. **Link Jitter → Late Packets**
+
+   * Because of sequence numbers and FLUSH\_SEQ, any INPUT\_EVENT with `seqNum ≤ flushSeq` is dropped. That prevents a stray event arriving after TOGGLE\_OFF from moving PC 2’s cursor.
+
+---
+
+## 17. Development Checklist
+
+1. **Bluetooth Pairing & Connection Module**
+
+   * Implement SPP server (PC 1) and client (PC 2) OR BLE GATT service/characteristic.
+   * Handle connect/disconnect events; signal application when connected or disconnected.
+2. **Raw HID Capture (PC 1)**
+
+   * Windows: implement Raw Input registration and WM\_INPUT parsing.
+   * Linux: open evdev, read `input_event` structs non-exclusively.
+   * macOS: set up IOHIDManager callback for mouse & keyboard.
+3. **Macro Detector**
+
+   * Listen for scroll “press” and “release.” Maintain ring buffer of timestamps. Trigger toggle on five presses within 1.5 s.
+4. **Serializer / Deserializer**
+
+   * Write code to pack/unpack the binary packet formats (HELLO, ACK, TOGGLE, INPUT\_EVENT, HEARTBEAT, FLUSH\_SEQ). Compute and verify checksums.
+   * Keep all fields little-endian.
+5. **Forwarding Logic (PC 1)**
+
+   * When `currentState = FORWARDING`, on any HID event:
+
+     1. Build INPUT\_EVENT with `sourceID = 0x01`, increment `seqNum`, set `timestamp`.
+     2. Send immediately.
+     3. Start heartbeat timer; every 5 s, send HEARTBEAT with current `seqNum`.
+   * When `currentState = LOCAL_CONTROL`, ignore captured HID events for forwarding (but OS cursor still moves).
+   * On macro toggle to LOCAL\_CONTROL, send FLUSH\_SEQ and TOGGLE\_OFF.
+   * On macro toggle to FORWARDING, send TOGGLE\_ON and wait for ACK. Retry up to 3 times.
+6. **Reception & Injection (PC 2)**
+
+   * On any data arrival: parse packet type.
+
+     * **HELLO:** respond with ACK. Handle state mismatch.
+     * **ACK:** if waiting for ACK for TOGGLE\_ON, stop retry and enter FORWARDING.
+     * **TOGGLE\_ON:** set `currentState = FORWARDING`. Show UI.
+     * **TOGGLE\_OFF:** set `currentState = LOCAL_CONTROL`. Show UI.
+     * **INPUT\_EVENT:** if `currentState = FORWARDING`, verify checksum, sourceID==0x01, `seqNum > lastSeqProcessed`, then inject via OS API. Update `lastSeqProcessed`.
+     * **HEARTBEAT:** reset heartbeat timer.
+     * **FLUSH\_SEQ:** drop pending events with `seqNum ≤ flushSeq`.
+   * In FORWARDING, drop all local HID events (filter them).
+   * If heartbeat misses 15 s, go to DISCONNECTED. Attempt reconnect.
+7. **UI Elements**
+
+   * PC 1: System tray icon with “Local Control” or “Forwarding.” Show tooltips (“Scroll × 5 to toggle”). Context menu: “Disconnect,” “Settings.”
+   * PC 2: Brief banner notifications on TOGGLE\_ON (“Forwarding Active”) and TOGGLE\_OFF (“Back to Local Control”), or on reconnect errors.
+8. **Testing Checklist**
+
+   * Verify normal single‐PC mouse/keyboard operation on PC 1 (LOCAL\_CONTROL).
+   * Pair PC 1↔PC 2; verify HELLO/ACK handshake.
+   * Test five‐click toggle: ensure false triggers do not occur when scrolling quickly.
+   * In FORWARDING: verify mouse moves, clicks, scrolls, keyboard presses all replicate instantly on PC 2.
+   * Test flipping back and forth multiple times, including rapid toggles.
+   * Disconnect Bluetooth mid‐forwarding; verify PC 1 falls back to LOCAL\_CONTROL and PC 2 falls back to LOCAL\_CONTROL. Upon reconnect, verify state sync.
+   * Test sleeping PC 2 mid-forwarding; wake; ensure correct state.
+   * Inject malformed packets and out-of-order sequence numbers; verify they are dropped gracefully.
+   * Simulate high latency (e.g., put both PCs far apart); verify sequence logic prevents stray events.
+   * Test on Windows, Linux, and macOS (if required) for capture/injection code.
+
+---
+
+## 18. Summary of Key Solutions
+
+* **HID Capture, Non-Blocking:** Use Raw Input (Windows), evdev (Linux), IOHIDManager (macOS) in non-exclusive mode so native cursor remains functional.
+* **Macro Detection:** Five discrete scroll‐wheel “press + release” events within 1.5 s; ring buffer of timestamps; reset after toggle.
+* **Binary Protocol:** All messages ≤ 20 bytes (for BLE compatibility).
+* **Source Tag & Sequence Number:** Each INPUT\_EVENT carries a 1 B source ID and 4 B seqNum. Drop events not from PC 1 or with stale seqNum.
+* **Heartbeat & Retry:** HEARTBEAT every 5 s; if PC 2 misses 3 heartbeats, revert to LOCAL\_CONTROL. On TOGGLE\_ON, retry ACK up to 3 times.
+* **Reconnect & State Resync:** On any reconnect, PC 2 sends HELLO(`lastState`, `lastSeqProcessed`); PC 1 responds with ACK(`currentState`, `currentSeq`). PC 1 then issues any missing TOGGLE to align.
+* **User Feedback:** Tray icon (PC 1) and banners (PC 2) to show current state.
+* **Security:** Leverage native BT encryption + optional 4 B token in each message.
+* **Platform‐Specific Injection:** Use OS APIs (SendInput, uinput, CGEvent).
+* **Pairing UX:** Standard OS pairing for PC 1↔PC 2, then simple “Connect” button in app.
+
+With this specification—protocol formats, state machines, timing windows, error recovery, and implementation hints—a software developer can implement the entire forwarding system. If there are any ambiguities or additional edge cases you’d like to address, let me know.
+
