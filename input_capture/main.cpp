@@ -1,27 +1,25 @@
 #include <iostream>
 #include <windows.h>
+
 #include "MouseHook.h"
-#include <conio.h>
 
 int main() {
     if (!InstallMouseHook()) {
-        std::cerr << "Failed to install mouse hook.\n";
+        std::cerr << "Failed to install Raw Input capture.\n";
         return 1;
     }
 
-    std::cout << "Mouse hook installed. Press ESC to exit.\n";
+    std::cout << "Raw Input capture running. Press ESC in this console to exit.\n";
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
-            break;
+    while ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) == 0) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        Sleep(10);
     }
 
     UninstallMouseHook();
-    std::cout << "Mouse hook uninstalled. Exiting.\n";
-
     return 0;
 }

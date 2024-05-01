@@ -1,46 +1,165 @@
 #include "MouseHook.h"
+
+#include <cstdint>
 #include <iostream>
-#include <windows.h>
-using namespace std;
+#include <vector>
 
-static HHOOK mouseHook = NULL;//this is like the thing you create and pass to a function regarding what you want . so like a mousehook is like a token / reference that can tell a particular function that you have to tell me the result based on this thing which is the token 
+namespace {
+HWND rawInputWindow = nullptr;
+constexpr wchar_t kWindowClassName[] = L"CrossPcRawInputSampleWindow";
 
-LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0) {
-        MSLLHOOKSTRUCT* mouseInfo = (MSLLHOOKSTRUCT*)lParam;
-        std::cout << "Mouse position: " << mouseInfo->pt.x << ", " << mouseInfo->pt.y << "\n";
+uint8_t ButtonMaskFromRawFlags(USHORT flags) {
+    if (flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP)) {
+        return 0x01;
+    }
+    if (flags & (RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP)) {
+        return 0x02;
+    }
+    if (flags & (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_UP)) {
+        return 0x04;
+    }
+    if (flags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP)) {
+        return 0x08;
+    }
+    if (flags & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP)) {
+        return 0x10;
+    }
+    return 0;
+}
 
-        switch (wParam) {
-            case WM_LBUTTONDBLCLK: std::cout << "Left button double-clicked\n"; break;
-            case WM_MBUTTONDBLCLK: std::cout << "Middle button double-clicked\n"; break;
-            case WM_RBUTTONDBLCLK: std::cout << "Right button double-clicked\n"; break;
-            case WM_MOUSEMOVE: std::cout << "Mouse moved\n"; break;
-            case WM_LBUTTONDOWN: std::cout << "Left button down\n"; break;
-            case WM_RBUTTONDOWN: std::cout << "Right button down\n"; break;
-            case WM_MBUTTONDOWN: std::cout << "Middle button down\n"; break;
-            case WM_LBUTTONUP: std::cout << "Left button up\n"; break;
-            case WM_RBUTTONUP: std::cout << "Right button up\n"; break;
-            case WM_MBUTTONUP: std::cout << "Middle button up\n"; break;
-            default: break;
-        }
+bool IsButtonDown(USHORT flags) {
+    return (flags & (RI_MOUSE_LEFT_BUTTON_DOWN |
+                     RI_MOUSE_RIGHT_BUTTON_DOWN |
+                     RI_MOUSE_MIDDLE_BUTTON_DOWN |
+                     RI_MOUSE_BUTTON_4_DOWN |
+                     RI_MOUSE_BUTTON_5_DOWN)) != 0;
+}
+
+void HandleRawInput(LPARAM lParam) {
+    UINT size = 0;
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr,
+                        &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0) {
+        return;
     }
 
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
+    std::vector<BYTE> buffer(size);
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, buffer.data(),
+                        &size, sizeof(RAWINPUTHEADER)) != size) {
+        return;
+    }
+
+    const auto* raw = reinterpret_cast<const RAWINPUT*>(buffer.data());
+    if (raw->header.dwType == RIM_TYPEMOUSE) {
+        const RAWMOUSE& mouse = raw->data.mouse;
+        if (mouse.lLastX != 0 || mouse.lLastY != 0) {
+            std::cout << "Raw mouse move dx=" << mouse.lLastX
+                      << " dy=" << mouse.lLastY << "\n";
+        }
+
+        const USHORT flags = mouse.usButtonFlags;
+        const uint8_t buttonMask = ButtonMaskFromRawFlags(flags);
+        if (buttonMask != 0) {
+            std::cout << "Raw mouse button mask=0x" << std::hex
+                      << static_cast<int>(buttonMask) << std::dec
+                      << (IsButtonDown(flags) ? " down" : " up") << "\n";
+        }
+        if (flags & RI_MOUSE_WHEEL) {
+            std::cout << "Raw mouse wheel delta="
+                      << static_cast<SHORT>(mouse.usButtonData) << "\n";
+        }
+    } else if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+        const RAWKEYBOARD& keyboard = raw->data.keyboard;
+        const bool down = (keyboard.Flags & RI_KEY_BREAK) == 0;
+        std::cout << "Raw keyboard vk=" << keyboard.VKey
+                  << (down ? " down" : " up") << "\n";
+    }
+}
+
+LRESULT CALLBACK RawInputWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_INPUT:
+        HandleRawInput(lParam);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProc(hwnd, message, wParam, lParam);
+    }
+}
+} // namespace
+
+LRESULT CALLBACK MouseHookProc(int, WPARAM, LPARAM) {
+    return 0;
 }
 
 bool InstallMouseHook() {
-    mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, NULL, 0);
-    return mouseHook != NULL;
+    if (rawInputWindow != nullptr) {
+        return true;
+    }
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = RawInputWndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = kWindowClassName;
+    RegisterClassW(&wc);
+
+    rawInputWindow = CreateWindowExW(0,
+                                     kWindowClassName,
+                                     L"Cross-PC Raw Input Capture",
+                                     0,
+                                     0,
+                                     0,
+                                     0,
+                                     0,
+                                     HWND_MESSAGE,
+                                     nullptr,
+                                     wc.hInstance,
+                                     nullptr);
+    if (rawInputWindow == nullptr) {
+        return false;
+    }
+
+    RAWINPUTDEVICE devices[2]{};
+    devices[0].usUsagePage = 0x01;
+    devices[0].usUsage = 0x02;
+    devices[0].dwFlags = RIDEV_INPUTSINK;
+    devices[0].hwndTarget = rawInputWindow;
+
+    devices[1].usUsagePage = 0x01;
+    devices[1].usUsage = 0x06;
+    devices[1].dwFlags = RIDEV_INPUTSINK;
+    devices[1].hwndTarget = rawInputWindow;
+
+    if (!RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE))) {
+        DestroyWindow(rawInputWindow);
+        rawInputWindow = nullptr;
+        return false;
+    }
+
+    std::cout << "Raw Input capture installed in non-exclusive INPUTSINK mode.\n";
+    std::cout << "Local OS input is not blocked because RIDEV_NOLEGACY is not used.\n";
+    return true;
 }
 
 bool UninstallMouseHook() {
-    if (mouseHook) {  // if it's installed
-        bool result = UnhookWindowsHookEx(mouseHook);
-        if (result) {
-            mouseHook = NULL;
-        }
-        return result;
+    if (rawInputWindow == nullptr) {
+        return true;
     }
-    return false; 
-}
 
+    RAWINPUTDEVICE devices[2]{};
+    devices[0].usUsagePage = 0x01;
+    devices[0].usUsage = 0x02;
+    devices[0].dwFlags = RIDEV_REMOVE;
+    devices[0].hwndTarget = nullptr;
+
+    devices[1].usUsagePage = 0x01;
+    devices[1].usUsage = 0x06;
+    devices[1].dwFlags = RIDEV_REMOVE;
+    devices[1].hwndTarget = nullptr;
+
+    RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE));
+    DestroyWindow(rawInputWindow);
+    rawInputWindow = nullptr;
+    return true;
+}
