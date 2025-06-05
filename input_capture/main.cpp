@@ -1,6 +1,7 @@
 #include <iostream>
 #include <windows.h>
 #include "MouseHook.h"
+#include <conio.h>
 
 int main() {
     if (!InstallMouseHook()) {

@@ -44,26 +44,3 @@ bool UninstallMouseHook() {
     return false; 
 }
 
-int main() {
-    if (!InstallMouseHook()) {
-        return 1;
-    }
-
-    std::cout << "Mouse hook installed. Press ESC to exit.\n";
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        // Exit loop if ESC key pressed
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
-            break;
-        }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    UninstallMouseHook();
-    std::cout << "Mouse hook uninstalled. Exiting.\n";
-
-    return 0;
-}
-
