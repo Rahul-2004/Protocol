@@ -63,8 +63,10 @@ bool SendPacket(const InputEventPacket& pkt) {
     return sent == sizeof(buffer);
 }
 
+
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0 || btSocket == INVALID_SOCKET)
+        // pass through non-mouse events or if socket’s dead
         return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     auto mi = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
@@ -74,10 +76,11 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     pkt.type     = TYPE_INPUT_EVENT;
     pkt.sourceID = SOURCE_PC1;
 
+    bool handled = true;  // we’ll handle (and swallow) by default
+
     switch (wParam) {
         case WM_MOUSEMOVE:
             pkt.eventType  = EVENT_MOVE;
-            // normalize to [0..1]
             m.dx = mi->pt.x / static_cast<float>(senderW);
             m.dy = mi->pt.y / static_cast<float>(senderH);
             m.buttonMask = 0;
@@ -112,14 +115,25 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             break;
 
         default:
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
+            // if it’s some other mouse message you don’t care to forward,
+            // let it pass through
+            handled = false;
     }
 
-    pkt.seqNum = ++seqNum;
-    SerializeMousePayload(m, pkt.payload);
-    SendPacket(pkt);
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
+    if (handled) {
+        // serialize & send to remote
+        pkt.seqNum = ++seqNum;
+        SerializeMousePayload(m, pkt.payload);
+        SendPacket(pkt);
+
+        // swallow it locally
+        return 1;
+    } else {
+        // let Windows handle it normally
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
 }
+
 int main() {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
