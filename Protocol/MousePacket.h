@@ -4,25 +4,24 @@
 
 #pragma pack(push, 1)
 
-// --- Core Packet Header ---
+// Core packet: 1 + 1 + 1 + 1 + 4 + 12 = 20 bytes
 struct InputEventPacket {
-    uint8_t type;         // e.g., 0x01 = INPUT_EVENT
-    uint8_t sourceID;     // 0x01 or 0x02
-    uint8_t eventType;    // MOVE, CLICK, etc.
-    uint8_t actionFlag;   // e.g., down/up
-    uint32_t seqNum;      // uint32, big endian if cross-platform
-    uint8_t payload[8];   // max size to fit within 20 bytes total (BLE safe)
+    uint8_t type;
+    uint8_t sourceID;
+    uint8_t eventType;
+    uint8_t actionFlag;
+    uint32_t seqNum;
+    uint8_t payload[12];  // increased from 8 to 12
 };
 
-// --- Payload: Mouse Events ---
 struct MouseEventPayload {
     uint8_t buttonMask;
-    int16_t dx;
-    int16_t dy;
-    int16_t data;  // scroll amount or 0
+    float dx;
+    float dy;
+    int16_t data;
 };
 
-// Optional: enum for source/event/action
+// Packet types
 enum PacketType : uint8_t {
     TYPE_INPUT_EVENT = 0x01,
     TYPE_TOGGLE_ON   = 0x12,
@@ -42,7 +41,7 @@ enum EventType : uint8_t {
 constexpr uint8_t SOURCE_PC1 = 0x01;
 constexpr uint8_t SOURCE_PC2 = 0x02;
 
-// Serialization helpers
+// Helpers
 inline void SerializeMousePayload(const MouseEventPayload& src, uint8_t* out) {
     std::memcpy(out, &src, sizeof(MouseEventPayload));
 }

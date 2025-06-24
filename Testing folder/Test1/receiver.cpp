@@ -1,73 +1,109 @@
-// Receiver.cpp
-#include <windows.h>
+// receiver.cpp
+
+#include <winsock2.h>
 #include <ws2bth.h>
 #include <bthsdpdef.h>
 #include <initguid.h>
 #include <iostream>
-#include "MouseInjector.h"
-#include "MousePacket.h"
+#include "../../Protocol/MousePacket.h"
+#include "../../input_injection/MouseInjector.h"
 
-// link against Ws2_32.lib and Bthprops.lib
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Bthprops.lib")
+#pragma comment(lib, "User32.lib")
 
-bool HandlePacket(const InputEventPacket& pkt) {
-    MouseEventPayload payload;
+SOCKET serverSocket = INVALID_SOCKET;
+SOCKET clientSocket = INVALID_SOCKET;
+
+bool HandleMousePacket(const InputEventPacket& pkt) {
+    MouseEventPayload payload{};
     DeserializeMousePayload(pkt.payload, payload);
 
     switch (pkt.eventType) {
-        case EVENT_MOVE:
-            // map payload.dx/payload.dy directly to absolute to simplify
-            return InjectMouseMoveAbsolute(payload.dx, payload.dy);
+    case EVENT_MOVE: {
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-        case EVENT_CLICK:
-            if (pkt.actionFlag)
-                return InjectMouseClick(static_cast<MouseButton>(payload.buttonMask));
-            else
-                return InjectMouseClick(static_cast<MouseButton>(payload.buttonMask));
+        int x = static_cast<int>(payload.dx * screenW);
+        int y = static_cast<int>(payload.dy * screenH);
 
-        case EVENT_SCROLL:
-            return InjectMouseScroll(payload.data);
-
-        default:
-            std::cerr << "[Receiver] Unknown eventType " << +pkt.eventType << "\n";
-            return false;
+        SetCursorPos(x, y);
+        return true;
     }
+
+    case EVENT_CLICK: {
+        if (payload.buttonMask & 0x01)
+            return InjectMouseClick(pkt.actionFlag ? LEFT : LEFT);
+        if (payload.buttonMask & 0x02)
+            return InjectMouseClick(pkt.actionFlag ? RIGHT : RIGHT);
+        if (payload.buttonMask & 0x04)
+            return InjectMouseClick(pkt.actionFlag ? MIDDLE : MIDDLE);
+        return false;
+    }
+
+    case EVENT_SCROLL:
+        return InjectMouseScroll(payload.data);
+
+    default:
+        std::cerr << "[Receiver] Unknown event type\n";
+        return false;
+}
+
 }
 
 int main() {
-    // 1) Setup Bluetooth server socket
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa)) return 1;
-    SOCKET srv = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-    if (srv == INVALID_SOCKET) return 1;
-
-    SOCKADDR_BTH local = {};
-    local.addressFamily = AF_BTH;
-    local.btAddr        = 0;    // any adapter
-    local.port          = 4;    // same port
-    bind(srv, (SOCKADDR*)&local, sizeof(local));
-    listen(srv, 1);
-
-    std::cout << "[Receiver] Waiting for connection...\n";
-    SOCKET cli = accept(srv, NULL, NULL);
-    std::cout << "[Receiver] Client connected.\n";
-
-    // 2) Receive loop
-    uint8_t buf[sizeof(InputEventPacket)];
-    int bytes;
-    while ((bytes = recv(cli, (char*)buf, sizeof(buf), 0)) == sizeof(buf)) {
-        InputEventPacket pkt;
-        DeserializePacket(buf, pkt);
-        if (!HandlePacket(pkt)) {
-            std::cerr << "[Receiver] Handling failed\n";
-        }
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        std::cerr << "[Receiver] WSAStartup failed\n";
+        return 1;
     }
 
-    // 3) Cleanup
-    closesocket(cli);
-    closesocket(srv);
+    serverSocket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "[Receiver] socket() failed\n";
+        WSACleanup();
+        return 1;
+    }
+
+    SOCKADDR_BTH bindAddr = {};
+    bindAddr.addressFamily = AF_BTH;
+    bindAddr.port = BT_PORT_ANY;
+
+    if (bind(serverSocket, (SOCKADDR*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+        std::cerr << "[Receiver] bind() failed\n";
+        closesocket(serverSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    int addrLen = sizeof(bindAddr);
+    getsockname(serverSocket, (SOCKADDR*)&bindAddr, &addrLen);
+    std::cout << "[Receiver] Listening on port: " << bindAddr.port << "\n";
+
+    listen(serverSocket, 1);
+    std::cout << "[Receiver] Waiting for sender...\n";
+
+    clientSocket = accept(serverSocket, NULL, NULL);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "[Receiver] accept() failed\n";
+        closesocket(serverSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "[Receiver] Client connected!\n";
+
+    InputEventPacket pkt;
+    while (true) {
+        int received = recv(clientSocket, (char*)&pkt, sizeof(pkt), 0);
+        if (received <= 0) break;
+
+        HandleMousePacket(pkt);
+    }
+
+    closesocket(clientSocket);
+    closesocket(serverSocket);
     WSACleanup();
-    std::cout << "[Receiver] Exiting.\n";
+    std::cout << "[Receiver] Exiting...\n";
     return 0;
 }
