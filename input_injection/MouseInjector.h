@@ -1,15 +1,12 @@
-#pragma once
+// MouseInjector.h
 
+#pragma once
 #include <windows.h>
 
-
-enum MouseButton {
-    LEFT,
-    RIGHT,
-    MIDDLE
-};
+enum MouseButton { LEFT, RIGHT, MIDDLE };
 
 bool InjectMouseMoveAbsolute(int x, int y);
-bool InjectMouseClick(MouseButton button);
+bool InjectMousePress(MouseButton button);
+bool InjectMouseRelease(MouseButton button);
+bool InjectMouseClick(MouseButton button);   // convenience: press+release
 bool InjectMouseScroll(int amount);
-

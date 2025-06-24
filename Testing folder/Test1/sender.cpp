@@ -21,9 +21,11 @@ struct InputEventPacket {
 #pragma pack(pop)
 
 struct MouseEventPayload {
-    float    dx, dy;
-    uint8_t  buttonMask;
-    int16_t  data;
+    float    dx;         // bytes 0–3
+    float    dy;         // bytes 4–7
+    uint8_t  buttonMask; // byte  8
+    int16_t  data;       // bytes 9–10
+    uint8_t  padding;    // byte 11 (to fill out your 12-byte array)
 };
 
 enum : uint8_t {
