@@ -16,16 +16,16 @@ struct InputEventPacket {
     uint8_t  eventType;
     uint8_t  actionFlag;
     uint32_t seqNum;
-    uint8_t  payload[12];  // Enough space for floats + extra
+    uint8_t  payload[12];
 };
 #pragma pack(pop)
 
 struct MouseEventPayload {
-    float    dx;         // bytes 0–3
-    float    dy;         // bytes 4–7
-    uint8_t  buttonMask; // byte  8
-    int16_t  data;       // bytes 9–10
-    uint8_t  padding;    // byte 11 (to fill out your 12-byte array)
+    float    dx;
+    float    dy;
+    uint8_t  buttonMask;
+    int16_t  data;
+    uint8_t  padding;
 };
 
 enum : uint8_t {
@@ -42,13 +42,14 @@ constexpr uint8_t BTN_MIDDLE = 0x04;
 
 SOCKET btSocket = INVALID_SOCKET;
 uint32_t seqNum = 0;
+static int senderW = GetSystemMetrics(SM_CXSCREEN);
+static int senderH = GetSystemMetrics(SM_CYSCREEN);
 
 void SerializeMousePayload(const MouseEventPayload& m, uint8_t* out) {
     std::memcpy(out,      &m.dx,         sizeof(float));
     std::memcpy(out + 4,  &m.dy,         sizeof(float));
     std::memcpy(out + 8,  &m.buttonMask, sizeof(uint8_t));
     std::memcpy(out + 9,  &m.data,       sizeof(int16_t));
-    // remaining bytes (payload[11]) unused
 }
 
 void SerializePacket(const InputEventPacket& p, uint8_t* out) {
@@ -76,8 +77,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     switch (wParam) {
         case WM_MOUSEMOVE:
             pkt.eventType  = EVENT_MOVE;
-            m.dx = static_cast<float>(mi->pt.x);
-            m.dy = static_cast<float>(mi->pt.y);
+            // normalize to [0..1]
+            m.dx = mi->pt.x / static_cast<float>(senderW);
+            m.dy = mi->pt.y / static_cast<float>(senderH);
             m.buttonMask = 0;
             m.data = 0;
             pkt.actionFlag = 0;
@@ -115,14 +117,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
     pkt.seqNum = ++seqNum;
     SerializeMousePayload(m, pkt.payload);
-
-    if (!SendPacket(pkt)) {
-        std::cerr << "[Sender] Failed to send packet, seq=" << pkt.seqNum << "\n";
-    }
-
+    SendPacket(pkt);
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
-
 int main() {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

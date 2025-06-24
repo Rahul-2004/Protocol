@@ -1,5 +1,4 @@
 // receiver.cpp
-
 #include <winsock2.h>
 #include <ws2bth.h>
 #include <bthsdpdef.h>
@@ -21,11 +20,12 @@ bool HandleMousePacket(const InputEventPacket& pkt) {
 
     switch (pkt.eventType) {
     case EVENT_MOVE: {
-        // payload.dx/dy are already absolute pixels
-        SetCursorPos(
-            static_cast<int>(payload.dx),
-            static_cast<int>(payload.dy)
-        );
+        // payload.dx/dy ∈ [0..1]
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int x = static_cast<int>(payload.dx * screenW);
+        int y = static_cast<int>(payload.dy * screenH);
+        SetCursorPos(x, y);
         return true;
     }
 
@@ -46,8 +46,7 @@ bool HandleMousePacket(const InputEventPacket& pkt) {
         return InjectMouseScroll(payload.data);
 
     default:
-        std::cerr << "[Receiver] Unknown event type: "
-                  << int(pkt.eventType) << "\n";
+        std::cerr << "[Receiver] Unknown event: " << int(pkt.eventType) << "\n";
         return false;
     }
 }
