@@ -20,13 +20,10 @@ bool HandleMousePacket(const InputEventPacket& pkt) {
 
     switch (pkt.eventType) {
     case EVENT_MOVE: {
-        // payload.dx/dy ∈ [0..1]
-        int screenW = GetSystemMetrics(SM_CXSCREEN);
-        int screenH = GetSystemMetrics(SM_CYSCREEN);
-        int x = static_cast<int>(payload.dx * screenW);
-        int y = static_cast<int>(payload.dy * screenH);
-        SetCursorPos(x, y);
-        return true;
+        return InjectMouseMoveAbsolute(
+        payload.dx,
+        payload.dy
+    );
     }
 
     case EVENT_CLICK: {
